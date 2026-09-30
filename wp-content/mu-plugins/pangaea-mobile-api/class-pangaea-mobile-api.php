@@ -2156,6 +2156,26 @@ final class Pangaea_Mobile_API {
 		return ( $term instanceof WP_Term ) ? $term : null;
 	}
 
+	/**
+	 * Advanced trip search/filter. Backward compatible with the original
+	 * four single-value params, but each now also accepts a comma-separated
+	 * list for multi-select (e.g. `destination=alula,neom`), OR'd within a
+	 * taxonomy and AND'd across taxonomies. Adds real, data-backed filters:
+	 * price range, duration range (days), departure date/month, an "on
+	 * sale" toggle, an "available to book now" toggle, and a Ladies Only
+	 * toggle — plus a `sort` param. See trip_filters() for the matching
+	 * price bounds / duration buckets / sort option / toggle metadata the
+	 * app renders its filter UI from.
+	 *
+	 * Departure date, on-sale and availability can't be expressed as a
+	 * plain postmeta range (departures live inside per-package serialized
+	 * data; on-sale/bookable status is computed, not stored), so whenever
+	 * one of those — or a non-relevance sort — is requested, every matching
+	 * trip is fetched and filtered/sorted/paginated in PHP instead of SQL.
+	 * The trip catalogue is a few hundred posts, so this stays fast; the
+	 * plain-filter path (the common case) is untouched and still paginates
+	 * in SQL via WP_Query.
+	 */
 	public static function list_trips( $request ) {
 		$lang     = self::lang( $request );
 		$page     = max( 1, (int) $request->get_param( 'page' ) );
@@ -2163,43 +2183,233 @@ final class Pangaea_Mobile_API {
 		$args     = array(
 			'post_type'      => 'trip',
 			'post_status'    => 'publish',
-			'posts_per_page' => $per_page,
-			'paged'          => $page,
 			's'              => sanitize_text_field( (string) $request->get_param( 'search' ) ),
 			'tax_query'      => array(),
+			'meta_query'     => array(),
 		);
+
 		foreach ( array( 'destination', 'activities', 'difficulty', 'travelstyle' ) as $tax ) {
-			$value = sanitize_text_field( (string) $request->get_param( $tax ) );
-			if ( $value && taxonomy_exists( $tax ) ) {
-				$args['tax_query'][] = array(
-					'taxonomy' => $tax,
-					'field'    => is_numeric( $value ) ? 'term_id' : 'slug',
-					'terms'    => is_numeric( $value ) ? (int) $value : $value,
-				);
+			$raw = (string) $request->get_param( $tax );
+			if ( '' === trim( $raw ) || ! taxonomy_exists( $tax ) ) {
+				continue;
 			}
+			$values = array_values( array_filter( array_map( 'trim', explode( ',', $raw ) ), 'strlen' ) );
+			if ( empty( $values ) ) {
+				continue;
+			}
+			$all_numeric         = count( array_filter( $values, 'is_numeric' ) ) === count( $values );
+			$args['tax_query'][] = array(
+				'taxonomy' => $tax,
+				'field'    => $all_numeric ? 'term_id' : 'slug',
+				'terms'    => $all_numeric ? array_map( 'intval', $values ) : $values,
+			);
 		}
+
+		if ( rest_sanitize_boolean( $request->get_param( 'ladies_only' ) ) ) {
+			// The 'destination' taxonomy has an old "Ladies Only Trips" term
+			// (id 262) with zero trips actually tagged on it — confirmed
+			// live. The term genuinely in use for this is 'travelstyle'
+			// "Women-Only Trips" (id 550, 7 real trips as of this writing).
+			$args['tax_query'][] = array(
+				'taxonomy' => 'travelstyle',
+				'field'    => 'term_id',
+				'terms'    => array( 550 ),
+			);
+		}
+
 		if ( count( $args['tax_query'] ) > 1 ) {
 			$args['tax_query']['relation'] = 'AND';
 		}
 		if ( empty( $args['tax_query'] ) ) {
 			unset( $args['tax_query'] );
 		}
-		$query = new WP_Query( $args );
-		$items = array();
-		foreach ( $query->posts as $post ) {
-			$items[] = self::trip_payload( $post, false, $lang );
+
+		// `_s_price` mirrors the same trip price shown to the app as a flat,
+		// indexed postmeta value (kept in sync by WP Travel Engine) — the
+		// only way to do a real SQL range filter, since the price itself
+		// lives inside a serialized settings blob.
+		$price_min = $request->get_param( 'price_min' );
+		$price_max = $request->get_param( 'price_max' );
+		if ( is_numeric( $price_min ) || is_numeric( $price_max ) ) {
+			$clause = array( 'key' => '_s_price', 'type' => 'NUMERIC' );
+			if ( is_numeric( $price_min ) && is_numeric( $price_max ) ) {
+				$clause['value']   = array( (float) $price_min, (float) $price_max );
+				$clause['compare'] = 'BETWEEN';
+			} elseif ( is_numeric( $price_min ) ) {
+				$clause['value']   = (float) $price_min;
+				$clause['compare'] = '>=';
+			} else {
+				$clause['value']   = (float) $price_max;
+				$clause['compare'] = '<=';
+			}
+			$args['meta_query'][] = $clause;
 		}
+
+		// `_s_duration` mirrors the same duration in HOURS, so day values
+		// from the app are converted (×24) before querying.
+		$duration_min = $request->get_param( 'duration_min' );
+		$duration_max = $request->get_param( 'duration_max' );
+		if ( is_numeric( $duration_min ) || is_numeric( $duration_max ) ) {
+			$clause = array( 'key' => '_s_duration', 'type' => 'NUMERIC' );
+			if ( is_numeric( $duration_min ) && is_numeric( $duration_max ) ) {
+				$clause['value']   = array( (float) $duration_min * 24, (float) $duration_max * 24 );
+				$clause['compare'] = 'BETWEEN';
+			} elseif ( is_numeric( $duration_min ) ) {
+				$clause['value']   = (float) $duration_min * 24;
+				$clause['compare'] = '>=';
+			} else {
+				$clause['value']   = (float) $duration_max * 24;
+				$clause['compare'] = '<=';
+			}
+			$args['meta_query'][] = $clause;
+		}
+
+		if ( count( $args['meta_query'] ) > 1 ) {
+			$args['meta_query']['relation'] = 'AND';
+		}
+		if ( empty( $args['meta_query'] ) ) {
+			unset( $args['meta_query'] );
+		}
+
+		$departure_from  = sanitize_text_field( (string) $request->get_param( 'departure_from' ) );
+		$departure_to    = sanitize_text_field( (string) $request->get_param( 'departure_to' ) );
+		$departure_month = sanitize_text_field( (string) $request->get_param( 'departure_month' ) );
+		if ( preg_match( '/^\d{4}-\d{2}$/', $departure_month ) ) {
+			$departure_from = $departure_month . '-01';
+			$departure_to   = gmdate( 'Y-m-t', strtotime( $departure_from ) );
+		}
+		$on_sale        = rest_sanitize_boolean( $request->get_param( 'on_sale' ) );
+		$available_only = rest_sanitize_boolean( $request->get_param( 'available_only' ) );
+		$sort           = sanitize_text_field( (string) $request->get_param( 'sort' ) );
+
+		$needs_post_filter = $on_sale || $available_only || '' !== $departure_from || '' !== $departure_to
+			|| in_array( $sort, array( 'price_asc', 'price_desc', 'soonest_departure' ), true );
+
+		if ( ! $needs_post_filter ) {
+			$args['posts_per_page'] = $per_page;
+			$args['paged']          = $page;
+			$query                  = new WP_Query( $args );
+			$items                  = array();
+			foreach ( $query->posts as $post ) {
+				$items[] = self::trip_payload( $post, false, $lang );
+			}
+			return self::ok(
+				array(
+					'items'      => array_values( array_filter( $items ) ),
+					'pagination' => array(
+						'page'        => $page,
+						'per_page'    => $per_page,
+						'total'       => (int) $query->found_posts,
+						'total_pages' => (int) $query->max_num_pages,
+					),
+				)
+			);
+		}
+
+		$args['posts_per_page'] = -1;
+		$query                  = new WP_Query( $args );
+		$from_ts                = '' !== $departure_from ? strtotime( $departure_from ) : null;
+		$to_ts                  = '' !== $departure_to ? strtotime( $departure_to . ' 23:59:59' ) : null;
+		$rows                   = array();
+
+		foreach ( $query->posts as $post ) {
+			$payload = self::trip_payload( $post, false, $lang );
+			if ( ! $payload ) {
+				continue;
+			}
+			if ( $on_sale && empty( $payload['has_sale'] ) ) {
+				continue;
+			}
+			if ( $available_only && empty( $payload['is_bookable'] ) ) {
+				continue;
+			}
+			$next_ts = self::trip_next_departure_ts( $post->ID );
+			if ( $from_ts || $to_ts ) {
+				if ( ! $next_ts ) {
+					continue;
+				}
+				if ( $from_ts && $next_ts < $from_ts ) {
+					continue;
+				}
+				if ( $to_ts && $next_ts > $to_ts ) {
+					continue;
+				}
+			}
+			$payload['next_departure'] = $next_ts ? wp_date( 'Y-m-d', $next_ts ) : null;
+			$rows[]                    = array( 'payload' => $payload, 'sort_ts' => $next_ts );
+		}
+
+		if ( 'price_asc' === $sort ) {
+			usort( $rows, function ( $a, $b ) { return $a['payload']['price'] <=> $b['payload']['price']; } );
+		} elseif ( 'price_desc' === $sort ) {
+			usort( $rows, function ( $a, $b ) { return $b['payload']['price'] <=> $a['payload']['price']; } );
+		} elseif ( 'soonest_departure' === $sort ) {
+			usort(
+				$rows,
+				function ( $a, $b ) {
+					if ( null === $a['sort_ts'] ) {
+						return null === $b['sort_ts'] ? 0 : 1;
+					}
+					if ( null === $b['sort_ts'] ) {
+						return -1;
+					}
+					return $a['sort_ts'] <=> $b['sort_ts'];
+				}
+			);
+		}
+
+		$total       = count( $rows );
+		$total_pages = $per_page > 0 ? (int) ceil( $total / $per_page ) : 1;
+		$slice       = array_slice( $rows, ( $page - 1 ) * $per_page, $per_page );
+		$items       = array_map(
+			function ( $row ) {
+				return $row['payload'];
+			},
+			$slice
+		);
+
 		return self::ok(
 			array(
-				'items'      => array_values( array_filter( $items ) ),
+				'items'      => $items,
 				'pagination' => array(
 					'page'        => $page,
 					'per_page'    => $per_page,
-					'total'       => (int) $query->found_posts,
-					'total_pages' => (int) $query->max_num_pages,
+					'total'       => $total,
+					'total_pages' => $total_pages,
 				),
 			)
 		);
+	}
+
+	/**
+	 * Earliest still-upcoming departure date across every package, as a
+	 * Unix timestamp (or null if none). Walks the same per-package
+	 * departure data compute_is_bookable() already reads — kept as a
+	 * separate helper rather than changing that one, so existing
+	 * is_bookable behaviour can't regress.
+	 */
+	private static function trip_next_departure_ts( $trip_id ) {
+		$today_ts = strtotime( wp_date( 'Y-m-d' ) );
+		$earliest = null;
+		foreach ( self::trip_packages_payload( $trip_id ) as $package ) {
+			foreach ( (array) ( $package['departures'] ?? array() ) as $departure ) {
+				if ( ! is_array( $departure ) ) {
+					continue;
+				}
+				$date = (string) ( $departure['start_date'] ?? $departure['date'] ?? '' );
+				if ( '' === $date ) {
+					continue;
+				}
+				$ts = strtotime( substr( $date, 0, 10 ) );
+				if ( ! $ts || $ts < $today_ts ) {
+					continue;
+				}
+				if ( null === $earliest || $ts < $earliest ) {
+					$earliest = $ts;
+				}
+			}
+		}
+		return $earliest;
 	}
 
 	public static function search_trips( $request ) {
@@ -2260,7 +2470,14 @@ final class Pangaea_Mobile_API {
 				$items[] = $payload;
 			}
 		}
-		return self::ok( array( 'query' => $query, 'items' => array_values( array_filter( $items ) ), 'language' => $lang ) );
+		return self::ok(
+			array(
+				'query'        => $query,
+				'did_you_mean' => self::did_you_mean_suggestion( $query ),
+				'items'        => array_values( array_filter( $items ) ),
+				'language'     => $lang,
+			)
+		);
 	}
 
 	/**
@@ -2392,13 +2609,120 @@ final class Pangaea_Mobile_API {
 
 		return self::ok(
 			array(
-				'query'    => $query,
-				'items'    => array_values( $items ),
-				'language' => $lang,
+				'query'        => $query,
+				'did_you_mean' => self::did_you_mean_suggestion( $query ),
+				'items'        => array_values( $items ),
+				'language'     => $lang,
 			)
 		);
 	}
 
+	/**
+	 * Every word (3+ Latin letters) worth spell-correcting against: term
+	 * names from the four filterable taxonomies, plus every published trip
+	 * title. Cached — this scans the whole catalogue, but only ever changes
+	 * when a trip/term is added or renamed.
+	 */
+	private static function did_you_mean_vocabulary() {
+		$cache_key = 'pangaea_did_you_mean_vocab_v1';
+		$cached    = get_transient( $cache_key );
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$words = array();
+		$add   = function ( $text ) use ( &$words ) {
+			foreach ( preg_split( '/[\s,\/\-]+/', (string) $text ) as $word ) {
+				$word = strtolower( trim( $word, ".,!?'\"" ) );
+				if ( strlen( $word ) >= 3 && ! preg_match( '/[^a-z]/', $word ) ) {
+					$words[ $word ] = true;
+				}
+			}
+		};
+
+		foreach ( array( 'destination', 'activities', 'travelstyle', 'difficulty' ) as $tax ) {
+			if ( ! taxonomy_exists( $tax ) ) {
+				continue;
+			}
+			$terms = get_terms( array( 'taxonomy' => $tax, 'hide_empty' => false ) );
+			if ( ! is_wp_error( $terms ) ) {
+				foreach ( $terms as $term ) {
+					$add( $term->name );
+				}
+			}
+		}
+
+		$trip_ids = get_posts(
+			array( 'post_type' => 'trip', 'post_status' => 'publish', 'posts_per_page' => -1, 'fields' => 'ids' )
+		);
+		foreach ( $trip_ids as $trip_id ) {
+			$add( get_the_title( $trip_id ) );
+		}
+
+		$vocab = array_keys( $words );
+		set_transient( $cache_key, $vocab, 6 * HOUR_IN_SECONDS );
+		return $vocab;
+	}
+
+	/**
+	 * "Did you mean" spelling correction for the app's search box —
+	 * separate from the existing fuzzy-scoring search engine (which already
+	 * tolerates typos when ranking results, but never tells the customer
+	 * what it matched). Word-by-word nearest-vocabulary-match via
+	 * levenshtein(), English/Latin-script only for now (Arabic needs a
+	 * different normalization approach — diacritics/letter-shape variants
+	 * — rather than plain character-distance matching, so it's intentionally
+	 * left alone here rather than giving bad corrections). Returns null when
+	 * the query already matches known vocabulary, or no confident
+	 * correction exists.
+	 */
+	private static function did_you_mean_suggestion( $query ) {
+		$query = trim( (string) $query );
+		if ( strlen( $query ) < 3 || preg_match( '/[^\x00-\x7F]/', $query ) ) {
+			return null;
+		}
+
+		$vocab   = self::did_you_mean_vocabulary();
+		$words   = preg_split( '/\s+/', strtolower( $query ) );
+		$changed = false;
+		$out     = array();
+
+		foreach ( $words as $word ) {
+			$clean = trim( $word, ".,!?'\"" );
+			if ( strlen( $clean ) < 3 || in_array( $clean, $vocab, true ) ) {
+				$out[] = $word;
+				continue;
+			}
+			$best      = null;
+			$best_dist = null;
+			foreach ( $vocab as $candidate ) {
+				if ( abs( strlen( $candidate ) - strlen( $clean ) ) > 3 ) {
+					continue;
+				}
+				$dist = levenshtein( $clean, $candidate );
+				if ( null === $best_dist || $dist < $best_dist ) {
+					$best_dist = $dist;
+					$best      = $candidate;
+				}
+			}
+			$threshold = max( 1, (int) round( strlen( $clean ) * 0.4 ) );
+			if ( $best && $best_dist > 0 && $best_dist <= $threshold ) {
+				$out[]   = $best;
+				$changed = true;
+			} else {
+				$out[] = $word;
+			}
+		}
+
+		return $changed ? implode( ' ', $out ) : null;
+	}
+
+	/**
+	 * Filter/sort metadata for the app's filter UI. `destination`/
+	 * `activities`/`difficulty`/`travelstyle` are now multi-select on the
+	 * app side (see list_trips()) — same term lists as before, just pass
+	 * a comma-separated list of the returned slugs/ids back in.
+	 */
 	public static function trip_filters( $request ) {
 		$lang = self::lang( $request );
 		$out  = array();
@@ -2408,6 +2732,54 @@ final class Pangaea_Mobile_API {
 		foreach ( array( 'destination', 'activities', 'difficulty', 'travelstyle' ) as $tax ) {
 			$out[ $tax ] = self::terms_payload( $tax, 0, false, $lang );
 		}
+
+		global $wpdb;
+		$row = $wpdb->get_row(
+			"SELECT MIN(CAST(pm.meta_value AS UNSIGNED)) AS min_price, MAX(CAST(pm.meta_value AS UNSIGNED)) AS max_price
+			 FROM {$wpdb->postmeta} pm
+			 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+			 WHERE pm.meta_key = '_s_price' AND p.post_type = 'trip' AND p.post_status = 'publish' AND pm.meta_value != ''"
+		);
+		$out['price_range'] = array(
+			'min' => $row ? (float) $row->min_price : 0,
+			'max' => $row ? (float) $row->max_price : 0,
+		);
+
+		$is_ar                    = 'ar' === $lang;
+		$out['duration_buckets']  = array(
+			array(
+				'key'      => 'weekend',
+				'label'    => $is_ar ? 'نهاية أسبوع (1-3 أيام)' : 'Weekend (1–3 days)',
+				'min_days' => 1,
+				'max_days' => 3,
+			),
+			array(
+				'key'      => 'short',
+				'label'    => $is_ar ? 'قصيرة (4-7 أيام)' : 'Short (4–7 days)',
+				'min_days' => 4,
+				'max_days' => 7,
+			),
+			array(
+				'key'      => 'long',
+				'label'    => $is_ar ? 'طويلة (8 أيام فأكثر)' : 'Long (8+ days)',
+				'min_days' => 8,
+				'max_days' => null,
+			),
+		);
+
+		$out['sort_options'] = array(
+			array( 'value' => 'relevance', 'label' => $is_ar ? 'الأنسب' : 'Best Match' ),
+			array( 'value' => 'price_asc', 'label' => $is_ar ? 'السعر: من الأقل للأعلى' : 'Price: Low to High' ),
+			array( 'value' => 'price_desc', 'label' => $is_ar ? 'السعر: من الأعلى للأقل' : 'Price: High to Low' ),
+			array( 'value' => 'soonest_departure', 'label' => $is_ar ? 'أقرب موعد مغادرة' : 'Soonest Departure' ),
+		);
+
+		$out['toggles'] = array(
+			array( 'key' => 'ladies_only', 'label' => $is_ar ? 'رحلات نسائية فقط' : 'Ladies Only' ),
+			array( 'key' => 'on_sale', 'label' => $is_ar ? 'عروض وخصومات' : 'On Sale' ),
+			array( 'key' => 'available_only', 'label' => $is_ar ? 'متاح للحجز الآن' : 'Available to Book Now' ),
+		);
+
 		return self::ok( $out );
 	}
 

@@ -1861,10 +1861,55 @@ final class Pangaea_Mobile_API {
 				'saudi_arabia_trips' => self::simple_trip_list( 10, $lang, 'saudi-arabia' ),
 				'world_trips'        => self::simple_trip_list( 10, $lang, 'worldwide' ),
 				'experiences'        => self::home_experiences_payload( 10 ),
+				'stays'              => self::home_stays_payload( 10 ),
 				'blogs'          => self::simple_post_list( 'post', 6, $lang ),
 				'ratings'        => self::home_ratings_payload(),
 			)
 		);
+	}
+
+	/**
+	 * Up to $limit rooms across stay.pangaeaclub.net's locations for the home
+	 * screen, positioned right after Experiences. Same raw room-object shape
+	 * list_stays()/get_stay() already return (no new "card" transform), so
+	 * the app can reuse whatever it already has for rendering a Stay room —
+	 * this is just a shorter, unfiltered slice for a teaser section, not a
+	 * separate data shape. Reuses stay_rooms_full_request()'s own hourly
+	 * transient cache, so this costs nothing extra beyond what
+	 * list_stays()/list_stay_locations() already pay for.
+	 *
+	 * Today there's a single location (AlUla, 4 rooms) so this simply returns
+	 * all of them, but it walks every location and stops once $limit rooms
+	 * are collected, so it keeps working correctly if more locations are
+	 * added later without needing a code change.
+	 */
+	private static function home_stays_payload( $limit ) {
+		$locations_body = self::stay_rooms_full_request( '/locations' );
+		$locations      = is_array( $locations_body ) ? (array) ( $locations_body['data'] ?? array() ) : array();
+		if ( empty( $locations ) ) {
+			return array();
+		}
+
+		$items = array();
+		foreach ( $locations as $location ) {
+			if ( count( $items ) >= $limit ) {
+				break;
+			}
+			$slug = sanitize_title( (string) ( $location['slug'] ?? '' ) );
+			if ( '' === $slug ) {
+				continue;
+			}
+			$remaining  = $limit - count( $items );
+			$rooms_body = self::stay_rooms_full_request( '', array( 'location' => $slug, 'per_page' => $remaining ) );
+			$rooms      = is_array( $rooms_body ) ? (array) ( $rooms_body['data'] ?? array() ) : array();
+			foreach ( $rooms as $room ) {
+				$items[] = $room;
+				if ( count( $items ) >= $limit ) {
+					break;
+				}
+			}
+		}
+		return $items;
 	}
 
 	/**
@@ -3613,19 +3658,62 @@ final class Pangaea_Mobile_API {
 
 		$filters = array( 'sort' => sanitize_key( (string) ( $request->get_param( 'sort' ) ?: 'recommended' ) ) );
 
-		$category = sanitize_text_field( (string) $request->get_param( 'category' ) );
-		if ( '' !== $category ) {
-			$term = get_term_by( is_numeric( $category ) ? 'id' : 'slug', $category, Pangaea_Experiences::TAX );
-			if ( $term instanceof WP_Term ) {
-				$filters['categories'] = array( (int) $term->term_id );
+		// Multiple categories: category=tour,adventure — previously this only
+		// ever looked up the whole raw string as one single slug/id, which
+		// silently matched no term for a comma-joined value and fell through
+		// to "no category filter at all" (returning every experience
+		// unfiltered). query_cards()'s tax_query already OR-matches an array
+		// of term ids correctly; this was purely a request-parsing gap.
+		// An invalid/unknown slug for a filter the app explicitly asked for
+		// must exclude everything, not silently return every experience —
+		// each filter below tracks whether it was requested at all vs.
+		// requested-but-matched-nothing, and the latter short-circuits to
+		// an empty result.
+		$no_match = false;
+
+		$category_param = sanitize_text_field( (string) $request->get_param( 'category' ) );
+		if ( '' !== $category_param ) {
+			$category_ids = array();
+			foreach ( array_filter( array_map( 'trim', explode( ',', $category_param ) ) ) as $slug_or_id ) {
+				$term = get_term_by( is_numeric( $slug_or_id ) ? 'id' : 'slug', $slug_or_id, Pangaea_Experiences::TAX );
+				if ( $term instanceof WP_Term ) {
+					$category_ids[] = (int) $term->term_id;
+				}
+			}
+			if ( $category_ids ) {
+				$filters['categories'] = $category_ids;
+			} else {
+				$no_match = true;
 			}
 		}
-		$destination = sanitize_text_field( (string) $request->get_param( 'destination' ) );
-		if ( '' !== $destination ) {
-			$term = get_term_by( is_numeric( $destination ) ? 'id' : 'slug', $destination, Pangaea_Experiences::TAX_DEST );
-			if ( $term instanceof WP_Term ) {
-				$filters['destinations'] = array( (int) $term->term_id );
+
+		// Multiple destinations: destination=alula,riyadh — same comma-split
+		// fix as category above (previously only a single slug/id was ever
+		// looked up, so a comma-joined value matched no term and silently
+		// fell through to "no destination filter at all").
+		$destination_param = sanitize_text_field( (string) $request->get_param( 'destination' ) );
+		if ( '' !== $destination_param ) {
+			$destination_ids = array();
+			foreach ( array_filter( array_map( 'trim', explode( ',', $destination_param ) ) ) as $slug_or_id ) {
+				$term = get_term_by( is_numeric( $slug_or_id ) ? 'id' : 'slug', $slug_or_id, Pangaea_Experiences::TAX_DEST );
+				if ( $term instanceof WP_Term ) {
+					$destination_ids[] = (int) $term->term_id;
+				}
 			}
+			if ( $destination_ids ) {
+				$filters['destinations'] = $destination_ids;
+			} else {
+				$no_match = true;
+			}
+		}
+
+		if ( $no_match ) {
+			return self::ok(
+				array(
+					'items'      => array(),
+					'pagination' => array( 'page' => $page, 'per_page' => $per_page, 'total' => 0, 'total_pages' => 0 ),
+				)
+			);
 		}
 		if ( '' !== (string) $request->get_param( 'price_min' ) ) {
 			$filters['price_min'] = (float) $request->get_param( 'price_min' );
@@ -3635,6 +3723,11 @@ final class Pangaea_Mobile_API {
 		}
 		if ( '' !== (string) $request->get_param( 'rating_min' ) ) {
 			$filters['rating_min'] = (float) $request->get_param( 'rating_min' );
+		}
+		// New: text search, matching the Trips convention (?search=).
+		$search = sanitize_text_field( (string) $request->get_param( 'search' ) );
+		if ( '' !== $search ) {
+			$filters['search'] = $search;
 		}
 
 		$cards = Pangaea_Experiences_Archive::query_cards( $filters );
@@ -3660,26 +3753,111 @@ final class Pangaea_Mobile_API {
 		}
 		$is_rtl = 'ar' === self::lang( $request );
 
-		$map = static function ( array $terms ) use ( $is_rtl ) {
+		// $term->count is WordPress's cached, language-UNAWARE taxonomy stat
+		// — it counts every published experience tagged with the term
+		// regardless of which language "current" is, so it reads roughly
+		// double the real per-language figure (confirmed live: raw_count 64
+		// for "Tour" vs. 33 real English / 31 real Arabic experiences). A
+		// real WP_Query, run after self::lang() has already switched WPML's
+		// active language, DOES correctly scope to that language — the same
+		// mechanism list_experiences() already relies on — so counts are
+		// recomputed that way instead of trusted from the term object.
+		$real_count = static function ( string $taxonomy, int $term_id ): int {
+			$q = new WP_Query(
+				array(
+					'post_type'      => Pangaea_Experiences::CPT,
+					'post_status'    => 'publish',
+					'posts_per_page' => 1,
+					'fields'         => 'ids',
+					'no_found_rows'  => false,
+					'tax_query'      => array( array( 'taxonomy' => $taxonomy, 'field' => 'term_id', 'terms' => array( $term_id ) ) ), // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_tax_query
+				)
+			);
+			return (int) $q->found_posts;
+		};
+
+		$map = static function ( array $terms, string $taxonomy ) use ( $is_rtl, $real_count ) {
 			$out = array();
 			foreach ( $terms as $term ) {
 				if ( ! $term instanceof WP_Term ) {
+					continue;
+				}
+				$count = $real_count( $taxonomy, (int) $term->term_id );
+				// Excludes terms with zero matching experiences IN THE
+				// CURRENT LANGUAGE — this also happens to remove a stray
+				// Arabic-named duplicate term (a second "National Day
+				// Offers" term accidentally created with its Arabic name as
+				// the primary name, sitting alongside the real English one)
+				// without needing a separate language-detection heuristic.
+				if ( 0 === $count ) {
 					continue;
 				}
 				$out[] = array(
 					'id'    => (int) $term->term_id,
 					'slug'  => $term->slug,
 					'name'  => Pangaea_Experiences::term_label( $term, $is_rtl ),
-					'count' => (int) $term->count,
+					'count' => $count,
 				);
 			}
 			return $out;
 		};
 
+		// Destinations: the taxonomy is a shallow "country > city" hierarchy
+		// (e.g. Saudi Arabia > Riyadh, AlUla, ...), and Experiences are only
+		// ever tagged on the CITY (leaf), never the country. Returning just
+		// the top-level parent (as this previously did) showed a single
+		// "Saudi Arabia" option that — because WordPress's tax_query
+		// implicitly includes descendants when you query a parent term —
+		// matches every experience, giving the app no real way to narrow by
+		// city at all. Leaf terms (no children of their own) are what's
+		// actually usable as a filter, so those are returned instead,
+		// regardless of taxonomy depth.
+		$all_destinations  = get_terms( array( 'taxonomy' => Pangaea_Experiences::TAX_DEST, 'hide_empty' => false, 'orderby' => 'name' ) );
+		$all_destinations  = is_wp_error( $all_destinations ) ? array() : $all_destinations;
+		$parent_ids        = array_unique( array_filter( array_map( static function ( $t ) {
+			return $t instanceof WP_Term ? (int) $t->parent : 0;
+		}, $all_destinations ) ) );
+		$leaf_destinations = array_values( array_filter( $all_destinations, static function ( $t ) use ( $parent_ids ) {
+			return $t instanceof WP_Term && ! in_array( (int) $t->term_id, $parent_ids, true );
+		} ) );
+
+		// Price range, scoped to the current language — reuses the exact
+		// same query_cards() the list endpoint uses (no filters but sort),
+		// so the slider bounds can never disagree with what /experiences
+		// actually returns for that language (previously computed from
+		// get_posts() with no language scoping at all — e.g. Arabic showed
+		// min 35 when the cheapest real Arabic experience is 45).
+		$all_cards = Pangaea_Experiences_Archive::query_cards( array( 'sort' => 'recommended' ) );
+		$price_min = null;
+		$price_max = null;
+		foreach ( $all_cards as $card ) {
+			$p = $card['price'] ?? null;
+			if ( null === $p ) {
+				continue;
+			}
+			if ( null === $price_min || $p < $price_min ) {
+				$price_min = $p;
+			}
+			if ( null === $price_max || $p > $price_max ) {
+				$price_max = $p;
+			}
+		}
+
 		return self::ok(
 			array(
-				'categories'   => $map( Pangaea_Experiences_Archive::categories() ),
-				'destinations' => $map( Pangaea_Experiences_Archive::destination_parents() ),
+				'categories'   => $map( Pangaea_Experiences_Archive::categories(), Pangaea_Experiences::TAX ),
+				'destinations' => $map( $leaf_destinations, Pangaea_Experiences::TAX_DEST ),
+				'price_range'  => array(
+					'min' => $price_min ?? 0,
+					'max' => $price_max ?? 0,
+				),
+				'sort_options' => array(
+					array( 'value' => 'recommended', 'label' => $is_rtl ? 'موصى به' : 'Recommended' ),
+					array( 'value' => 'price_asc', 'label' => $is_rtl ? 'السعر: من الأقل للأعلى' : 'Price: Low to High' ),
+					array( 'value' => 'price_desc', 'label' => $is_rtl ? 'السعر: من الأعلى للأقل' : 'Price: High to Low' ),
+					array( 'value' => 'rating', 'label' => $is_rtl ? 'الأعلى تقييمًا' : 'Top Rated' ),
+					array( 'value' => 'soonest', 'label' => $is_rtl ? 'أقرب موعد' : 'Soonest Available' ),
+				),
 			)
 		);
 	}

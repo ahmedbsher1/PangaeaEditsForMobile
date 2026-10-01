@@ -2763,6 +2763,7 @@ final class Pangaea_Mobile_API {
 		$candidate_cap = max( $limit * 3, 30 );
 
 		$trip_matches = array();
+		$trip_seen    = array();
 		if ( $include_trips
 			&& function_exists( 'pangaea_smart_trip_search_ranked_ids' )
 			&& function_exists( 'pangaea_smart_trip_search_score' )
@@ -2782,8 +2783,40 @@ final class Pangaea_Mobile_API {
 				if ( ! self::text_matches_lang( $payload['title'] ?? '', $lang ) ) {
 					continue;
 				}
+				$trip_seen[ $id ] = true;
+				$payload['type']  = 'trip';
+				$trip_matches[]   = array( 'score' => (float) $score, 'payload' => $payload );
+			}
+		}
+
+		// Same gap search_trips() already covers (see its own comment above):
+		// the smart engine's ranked-ID cache has a scoring floor and can miss
+		// a plain substring match entirely — confirmed live, e.g. "morocco"/
+		// "italy" returned real trips via /trips/search's native fallback but
+		// nothing at all here. Without this, /search could silently be a
+		// strict subset of /trips/search for the same word.
+		if ( $include_trips && count( $trip_matches ) < $candidate_cap ) {
+			$fallback = new WP_Query(
+				array(
+					'post_type'      => 'trip',
+					'post_status'    => 'publish',
+					'posts_per_page' => $candidate_cap - count( $trip_matches ),
+					's'              => $query,
+					'post__not_in'   => array_keys( $trip_seen ),
+				)
+			);
+			foreach ( $fallback->posts as $post ) {
+				$id      = (int) $post->ID;
+				$payload = self::trip_payload( $post, false, $lang );
+				if ( ! is_array( $payload ) || ! self::text_matches_lang( $payload['title'] ?? '', $lang ) ) {
+					continue;
+				}
+				$payload = self::add_mobile_card_fields( $payload, $id );
+				// Found by substring, not by the scoring engine — kept near
+				// the bottom of the trip results rather than guessing a
+				// competitive score for a match the engine itself didn't rank.
 				$payload['type'] = 'trip';
-				$trip_matches[]  = array( 'score' => (float) $score, 'payload' => $payload );
+				$trip_matches[]  = array( 'score' => 1.0, 'payload' => $payload );
 			}
 		}
 

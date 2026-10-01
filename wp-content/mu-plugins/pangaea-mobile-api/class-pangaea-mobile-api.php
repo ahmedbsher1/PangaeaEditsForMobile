@@ -358,6 +358,7 @@ final class Pangaea_Mobile_API {
 		self::route( '/notifications/preferences', 'PATCH', 'notifications_update_preferences', true );
 
 		self::route( '/stays', 'GET', 'list_stays', false );
+		self::route( '/stays/filters', 'GET', 'stays_filters', false );
 		self::route( '/stays/locations', 'GET', 'list_stay_locations', false );
 		self::route( '/stays/(?P<room_id>\d+)', 'GET', 'get_stay', false );
 		self::route( '/policies', 'GET', 'policies', false );
@@ -6734,26 +6735,139 @@ final class Pangaea_Mobile_API {
 		return array_slice( $matches, 0, $cap );
 	}
 
-	public static function list_stays( $request ) {
-		$location = sanitize_title( (string) $request->get_param( 'location' ) );
-		if ( '' === $location ) {
-			return self::fail( 'location_required', 'A location is required, e.g. ?location=alula.' );
+	/**
+	 * Every room across the given location slugs (or every known location
+	 * when none are given), pulled from the same hourly-cached per-location
+	 * request list_stays()/stay_search_matches() already use. Filtering
+	 * happens here, not on stay.pangaeaclub.net, since that site's own API
+	 * is location-scoped only and has no filter params of its own — the
+	 * whole catalog is small enough (a handful of locations, a few rooms
+	 * each) that fetching it all up front and filtering locally is cheap,
+	 * and it means the app isn't blocked on that other team building
+	 * filtering support on their end.
+	 */
+	private static function stays_all_rooms( array $location_slugs = array() ) {
+		if ( empty( $location_slugs ) ) {
+			$locations_body = self::stay_rooms_full_request( '/locations' );
+			if ( null === $locations_body ) {
+				return array( 'rooms' => array(), 'ok' => false );
+			}
+			foreach ( (array) ( $locations_body['data'] ?? array() ) as $loc ) {
+				$slug = sanitize_title( (string) ( $loc['slug'] ?? '' ) );
+				if ( '' !== $slug ) {
+					$location_slugs[] = $slug;
+				}
+			}
 		}
+		$rooms   = array();
+		$any_ok  = false;
+		foreach ( array_unique( $location_slugs ) as $slug ) {
+			$body = self::stay_rooms_full_request( '', array( 'location' => $slug, 'per_page' => 100 ) );
+			if ( null === $body ) {
+				continue;
+			}
+			$any_ok = true;
+			foreach ( (array) ( $body['data'] ?? array() ) as $room ) {
+				if ( is_array( $room ) ) {
+					$rooms[] = $room;
+				}
+			}
+		}
+		return array( 'rooms' => $rooms, 'ok' => $any_ok || empty( $location_slugs ) );
+	}
+
+	/**
+	 * True if a room satisfies every filter that was actually supplied —
+	 * price range, minimum guest capacity (occupancy.max_people), and a
+	 * required set of facility types (AND, not OR: a guest asking for
+	 * "wifi,air-conditioning" wants both, not either).
+	 */
+	private static function stay_room_matches_filters( array $room, $price_min, $price_max, $guests_min, array $facility_types ) {
+		if ( null !== $price_min || null !== $price_max ) {
+			$price = (float) ( $room['pricing']['regular_price'] ?? 0 );
+			if ( null !== $price_min && $price < (float) $price_min ) {
+				return false;
+			}
+			if ( null !== $price_max && $price > (float) $price_max ) {
+				return false;
+			}
+		}
+		if ( $guests_min > 0 ) {
+			$max_people = (int) ( $room['occupancy']['max_people'] ?? 0 );
+			if ( $max_people < $guests_min ) {
+				return false;
+			}
+		}
+		if ( ! empty( $facility_types ) ) {
+			$room_types = array();
+			foreach ( (array) ( $room['facilities'] ?? array() ) as $facility ) {
+				if ( is_array( $facility ) && ! empty( $facility['type'] ) ) {
+					$room_types[] = sanitize_title( (string) $facility['type'] );
+				}
+			}
+			foreach ( $facility_types as $needed ) {
+				if ( ! in_array( $needed, $room_types, true ) ) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	public static function list_stays( $request ) {
+		$location_param = sanitize_text_field( (string) $request->get_param( 'location' ) );
+		$location_slugs = array_values( array_filter( array_map( 'sanitize_title', explode( ',', $location_param ) ) ) );
+
+		$price_min_raw = $request->get_param( 'price_min' );
+		$price_max_raw = $request->get_param( 'price_max' );
+		$price_min     = ( null === $price_min_raw || '' === $price_min_raw ) ? null : (float) $price_min_raw;
+		$price_max     = ( null === $price_max_raw || '' === $price_max_raw ) ? null : (float) $price_max_raw;
+		$guests_min    = max( 0, (int) $request->get_param( 'guests' ) );
+		$facilities_param = sanitize_text_field( (string) $request->get_param( 'facilities' ) );
+		$facility_types    = array_values( array_filter( array_map( 'sanitize_title', explode( ',', $facilities_param ) ) ) );
+		$sort = sanitize_key( (string) $request->get_param( 'sort' ) );
+
 		$page     = max( 1, (int) $request->get_param( 'page' ) );
 		$per_page = min( 100, max( 1, (int) ( $request->get_param( 'per_page' ) ?: 50 ) ) );
-		$body     = self::stay_rooms_full_request( '', array( 'location' => $location, 'page' => $page, 'per_page' => $per_page ) );
-		if ( null === $body ) {
+
+		$result = self::stays_all_rooms( $location_slugs );
+		if ( ! $result['ok'] ) {
 			return self::fail( 'stays_unavailable', 'Stays module is temporarily unavailable.', 503 );
 		}
+
+		$rooms = array_values(
+			array_filter(
+				$result['rooms'],
+				static function ( $room ) use ( $price_min, $price_max, $guests_min, $facility_types ) {
+					return self::stay_room_matches_filters( $room, $price_min, $price_max, $guests_min, $facility_types );
+				}
+			)
+		);
+
+		if ( 'price_asc' === $sort || 'price_desc' === $sort ) {
+			usort(
+				$rooms,
+				static function ( $a, $b ) use ( $sort ) {
+					$pa = (float) ( $a['pricing']['regular_price'] ?? 0 );
+					$pb = (float) ( $b['pricing']['regular_price'] ?? 0 );
+					return 'price_asc' === $sort ? ( $pa <=> $pb ) : ( $pb <=> $pa );
+				}
+			);
+		}
+
+		$total       = count( $rooms );
+		$total_pages = (int) ceil( $total / $per_page );
+		$slice       = array_slice( $rooms, ( $page - 1 ) * $per_page, $per_page );
+
 		return self::ok(
 			array(
-				'location'   => $location,
-				'items'      => $body['data'] ?? array(),
+				'location'   => $location_param,
+				'items'      => $slice,
 				'pagination' => array(
 					'page'        => $page,
 					'per_page'    => $per_page,
-					'total'       => (int) ( $body['total'] ?? 0 ),
-					'total_pages' => (int) ( $body['total_pages'] ?? 0 ),
+					'total'       => $total,
+					'total_pages' => $total_pages,
 				),
 			)
 		);
@@ -6771,6 +6885,69 @@ final class Pangaea_Mobile_API {
 	public static function list_stay_locations( $request ) {
 		$body = self::stay_rooms_full_request( '/locations' );
 		return self::ok( array( 'items' => ( null === $body ) ? array() : ( $body['data'] ?? array() ) ) );
+	}
+
+	/**
+	 * Real price/guest ranges and the live set of facility types, computed
+	 * from the same cached room data list_stays() filters against — so the
+	 * app's filter UI always matches what list_stays() can actually filter
+	 * by, the same guarantee trip_filters()/experience_filters() give for
+	 * Journeys and Experiences.
+	 */
+	public static function stays_filters( $request ) {
+		$result = self::stays_all_rooms();
+		if ( ! $result['ok'] ) {
+			return self::fail( 'stays_unavailable', 'Stays module is temporarily unavailable.', 503 );
+		}
+		$rooms = $result['rooms'];
+
+		$prices  = array();
+		$guests  = array();
+		$facility_types = array();
+		foreach ( $rooms as $room ) {
+			if ( isset( $room['pricing']['regular_price'] ) ) {
+				$prices[] = (float) $room['pricing']['regular_price'];
+			}
+			if ( isset( $room['occupancy']['max_people'] ) ) {
+				$guests[] = (int) $room['occupancy']['max_people'];
+			}
+			foreach ( (array) ( $room['facilities'] ?? array() ) as $facility ) {
+				if ( ! is_array( $facility ) || empty( $facility['type'] ) ) {
+					continue;
+				}
+				$type = sanitize_title( (string) $facility['type'] );
+				if ( ! isset( $facility_types[ $type ] ) ) {
+					$facility_types[ $type ] = array(
+						'type' => $type,
+						'name' => (string) ( $facility['name'] ?? $type ),
+						'icon' => (string) ( $facility['icon'] ?? '' ),
+					);
+				}
+			}
+		}
+
+		$locations_body = self::stay_rooms_full_request( '/locations' );
+		$locations      = is_array( $locations_body ) ? (array) ( $locations_body['data'] ?? array() ) : array();
+
+		return self::ok(
+			array(
+				'locations'      => array_values( $locations ),
+				'price_range'    => array(
+					'min' => $prices ? min( $prices ) : 0,
+					'max' => $prices ? max( $prices ) : 0,
+				),
+				'guests_range'   => array(
+					'min' => $guests ? min( $guests ) : 1,
+					'max' => $guests ? max( $guests ) : 1,
+				),
+				'facility_types' => array_values( $facility_types ),
+				'sort_options'   => array(
+					array( 'key' => 'recommended', 'label' => 'Recommended', 'label_ar' => 'موصى به' ),
+					array( 'key' => 'price_asc', 'label' => 'Price: low to high', 'label_ar' => 'السعر: من الأقل للأعلى' ),
+					array( 'key' => 'price_desc', 'label' => 'Price: high to low', 'label_ar' => 'السعر: من الأعلى للأقل' ),
+				),
+			)
+		);
 	}
 
 	public static function notifications_register_device( $request ) {

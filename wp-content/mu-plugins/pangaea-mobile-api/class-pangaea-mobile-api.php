@@ -1445,27 +1445,21 @@ final class Pangaea_Mobile_API {
 
 	/**
 	 * Account deletion — required by both app stores for any app that lets
-	 * people create an account. Confirms the current password first (a
-	 * stolen access token alone shouldn't be enough to destroy the
-	 * account), except for Google/Apple-only accounts, which have no
-	 * usable WP password to confirm with — the valid access token itself
-	 * is the only credential those ever had. The actual deletion mechanics
-	 * live in delete_user_account() below, shared with the website's own
-	 * Account Details "Delete Account" action (pangaea-account-delete.php)
-	 * so both surfaces can never drift apart.
+	 * people create an account. The mobile app confirms with a plain yes/no
+	 * prompt, no password re-entry (by explicit product decision) — a valid
+	 * access token is the only thing this checks, same as every other
+	 * authenticated endpoint. The website's own Account Details "Delete
+	 * Account" action (pangaea-account-delete.php) still asks for the
+	 * current password itself, before ever calling this; that's a separate
+	 * surface's own choice, not something this endpoint enforces. The
+	 * actual deletion mechanics live in delete_user_account() below, shared
+	 * by both surfaces so they can never drift apart.
 	 */
 	public static function delete_account( $request ) {
 		$uid  = self::user_id_from_request( $request );
 		$user = get_userdata( $uid );
 		if ( ! $user ) {
 			return self::fail( 'user_not_found', 'Account not found.', 404 );
-		}
-
-		$data         = self::request_data( $request );
-		$password     = (string) ( $data['password'] ?? '' );
-		$has_password = '' !== (string) $user->user_pass;
-		if ( $has_password && ! wp_check_password( $password, $user->user_pass, $uid ) ) {
-			return self::fail( 'invalid_password', 'Current password is incorrect.', 401 );
 		}
 
 		if ( ! self::delete_user_account( $uid ) ) {

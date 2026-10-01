@@ -362,6 +362,7 @@ final class Pangaea_Mobile_API {
 		self::route( '/stays/filters', 'GET', 'stays_filters', false );
 		self::route( '/stays/locations', 'GET', 'list_stay_locations', false );
 		self::route( '/stays/(?P<room_id>\d+)', 'GET', 'get_stay', false );
+		self::route( '/home/hero', 'GET', 'get_home_hero', false );
 		self::route( '/policies', 'GET', 'policies', false );
 		self::route( '/consents', 'POST', 'consents', true );
 		self::route( '/analytics/events', 'POST', 'analytics_event', false );
@@ -2133,6 +2134,39 @@ final class Pangaea_Mobile_API {
 		}
 
 		return self::ok( array( 'items' => $items, 'language' => $lang ) );
+	}
+
+	/**
+	 * Home screen hero section (the top banner with background media and
+	 * overlaid text) is admin-controlled from wp-admin → Settings → Home
+	 * Hero (Pangaea_Home_Hero, mu-plugins/pangaea-home-hero.php). No auth:
+	 * this is the very first thing shown on the Home tab. Arabic falls
+	 * back to English per-field if the admin hasn't filled in the Arabic
+	 * text yet, same convention as Onboarding/About Us above.
+	 */
+	public static function get_home_hero( $request ) {
+		$lang  = self::lang( $request );
+		$is_ar = 'ar' === $lang;
+		$data  = class_exists( 'Pangaea_Home_Hero' ) ? Pangaea_Home_Hero::get_settings() : array();
+
+		$pick = static function ( array $data, string $key ) use ( $is_ar ) {
+			$value = $is_ar ? (string) ( $data[ $key . '_ar' ] ?? '' ) : (string) ( $data[ $key . '_en' ] ?? '' );
+			return '' !== $value ? $value : (string) ( $data[ $key . '_en' ] ?? '' );
+		};
+
+		$media_type = ( 'video' === ( $data['media_type'] ?? '' ) ) ? 'video' : 'image';
+
+		return self::ok(
+			array(
+				'media_type'   => $media_type,
+				'image_url'    => (string) ( $data['image_url'] ?? '' ),
+				'video_url'    => ( 'video' === $media_type ) ? (string) ( $data['video_url'] ?? '' ) : '',
+				'welcome_text' => $pick( $data, 'welcome' ),
+				'headline'     => $pick( $data, 'headline' ),
+				'subtext'      => $pick( $data, 'subtext' ),
+				'language'     => $lang,
+			)
+		);
 	}
 
 	/**

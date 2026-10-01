@@ -354,7 +354,10 @@ final class Pangaea_Mobile_API {
 		self::route( '/notifications/(?P<notification_id>[A-Za-z0-9_-]+)/read', 'POST', 'mark_notification_read', true );
 		self::route( '/notifications/read-all', 'POST', 'mark_all_notifications_read', true );
 		self::route( '/notifications/devices', 'POST', 'notifications_register_device', true );
-		self::route( '/notifications/devices/(?P<device_id>[A-Za-z0-9_-]+)', 'DELETE', 'notifications_delete_device', true );
+		// The app passes its raw FCM token as {device_id} (see
+		// notifications_register_device()'s docblock) — real tokens commonly
+		// contain ':' and other characters a stricter pattern would 404 on.
+		self::route( '/notifications/devices/(?P<device_id>[^/]+)', 'DELETE', 'notifications_delete_device', true );
 		self::route( '/notifications/preferences', 'GET', 'notifications_get_preferences', true );
 		self::route( '/notifications/preferences', 'PATCH', 'notifications_update_preferences', true );
 
@@ -7259,25 +7262,73 @@ final class Pangaea_Mobile_API {
 		);
 	}
 
+	/**
+	 * Historically this only wrote to a usermeta device registry
+	 * (DEVICES_META) that nothing else in this file ever reads — it never
+	 * actually fed the push-sending system (Pangaea_Push_Notifications,
+	 * which sends from the `pga_push_tokens` table via register_device_token()
+	 * above). Confirmed live: the mobile app registers its FCM token through
+	 * THIS endpoint, not /device-token, so every token was landing in a
+	 * registry no send path ever queries — any admin-sent push would have
+	 * silently reached nobody. Now upserts into `pga_push_tokens` exactly
+	 * like register_device_token(), so whichever endpoint the app calls,
+	 * the token ends up somewhere real pushes actually get sent from. The
+	 * usermeta registry is still written for backward compatibility, but is
+	 * no longer load-bearing for delivery.
+	 *
+	 * The app has no separate "device id" concept of its own — it sends the
+	 * push token itself as `device_id` (no `token` field), so `token` is
+	 * accepted first and `device_id` as a fallback. The id returned here IS
+	 * the token value, so DELETE /notifications/devices/{that value} always
+	 * matches, regardless of which field name produced it.
+	 */
 	public static function notifications_register_device( $request ) {
-		$uid = self::user_id_from_request( $request );
+		$uid  = self::user_id_from_request( $request );
 		$data = self::sanitize_deep( self::request_data( $request ) );
-		$devices = get_user_meta( $uid, self::DEVICES_META, true );
-		$devices = is_array( $devices ) ? $devices : array();
-		$id = sanitize_text_field( (string) ( $data['device_id'] ?? wp_generate_uuid4() ) );
-		$data['device_id'] = $id;
-		$data['updated_at'] = current_time( 'mysql' );
-		$devices[ $id ] = $data;
+
+		$token = sanitize_text_field( (string) ( $data['token'] ?? $data['device_id'] ?? '' ) );
+		if ( '' === $token ) {
+			return self::fail( 'token_required', 'A device token is required.' );
+		}
+		$platform = sanitize_key( (string) ( $data['platform'] ?? '' ) );
+
+		global $wpdb;
+		$table       = $wpdb->prefix . 'pga_push_tokens';
+		$now         = current_time( 'mysql' );
+		$existing_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE token = %s", $token ) );
+		if ( $existing_id ) {
+			$wpdb->update( $table, array( 'user_id' => $uid, 'platform' => $platform, 'updated_at' => $now ), array( 'id' => (int) $existing_id ) );
+		} else {
+			$wpdb->insert( $table, array( 'user_id' => $uid, 'token' => $token, 'platform' => $platform, 'created_at' => $now, 'updated_at' => $now ) );
+		}
+
+		$devices             = get_user_meta( $uid, self::DEVICES_META, true );
+		$devices             = is_array( $devices ) ? $devices : array();
+		$data['device_id']   = $token;
+		$data['updated_at']  = $now;
+		$devices[ $token ]   = $data;
 		update_user_meta( $uid, self::DEVICES_META, $devices );
+
+		$data['id'] = $token;
 		return self::ok( $data, 201 );
 	}
 
 	public static function notifications_delete_device( $request ) {
 		$uid = self::user_id_from_request( $request );
+		// WP_REST_Server does not urldecode a custom route regex capture —
+		// an FCM token's ':' arrives here still as a literal "%3A" unless
+		// decoded explicitly (confirmed live: the delete silently matched
+		// nothing without this).
+		$token = rawurldecode( (string) $request['device_id'] );
+
+		global $wpdb;
+		$wpdb->delete( $wpdb->prefix . 'pga_push_tokens', array( 'token' => $token ) );
+
 		$devices = get_user_meta( $uid, self::DEVICES_META, true );
 		$devices = is_array( $devices ) ? $devices : array();
-		unset( $devices[ (string) $request['device_id'] ] );
+		unset( $devices[ $token ] );
 		update_user_meta( $uid, self::DEVICES_META, $devices );
+
 		return self::ok( array( 'deleted' => true ) );
 	}
 

@@ -1445,18 +1445,10 @@ final class Pangaea_Mobile_API {
 	 * stolen access token alone shouldn't be enough to destroy the
 	 * account), except for Google/Apple-only accounts, which have no
 	 * usable WP password to confirm with — the valid access token itself
-	 * is the only credential those ever had.
-	 *
-	 * wp_delete_user() purges every usermeta row for this user on its own
-	 * (saved travellers, billing/health profile, wishlist, notification
-	 * feed, refresh tokens — all stored as usermeta), so nothing here
-	 * re-deletes those individually. Two things live outside usermeta and
-	 * need explicit cleanup first: the push-notification tokens table, and
-	 * two uploaded files (profile photo, passport doc) that are personal
-	 * data in their own right. WooCommerce orders are deliberately left
-	 * alone — they keep their own billing snapshot independent of the user
-	 * record, which is the standard, legally-expected way to retain
-	 * financial/tax records after a customer deletes their account.
+	 * is the only credential those ever had. The actual deletion mechanics
+	 * live in delete_user_account() below, shared with the website's own
+	 * Account Details "Delete Account" action (pangaea-account-delete.php)
+	 * so both surfaces can never drift apart.
 	 */
 	public static function delete_account( $request ) {
 		$uid  = self::user_id_from_request( $request );
@@ -1470,6 +1462,36 @@ final class Pangaea_Mobile_API {
 		$has_password = '' !== (string) $user->user_pass;
 		if ( $has_password && ! wp_check_password( $password, $user->user_pass, $uid ) ) {
 			return self::fail( 'invalid_password', 'Current password is incorrect.', 401 );
+		}
+
+		if ( ! self::delete_user_account( $uid ) ) {
+			return self::fail( 'delete_failed', 'Could not delete account. Please try again.', 500 );
+		}
+
+		return self::ok( array( 'deleted' => true ) );
+	}
+
+	/**
+	 * Core account-deletion mechanics, with no request/response handling of
+	 * its own — callers (this class's delete_account() above, and the
+	 * website's pga_account_delete_ajax_handler()) are responsible for
+	 * their own auth + password confirmation before calling this.
+	 *
+	 * wp_delete_user() purges every usermeta row for this user on its own
+	 * (saved travellers, billing/health profile, wishlist, notification
+	 * feed, refresh tokens — all stored as usermeta), so nothing here
+	 * re-deletes those individually. Two things live outside usermeta and
+	 * need explicit cleanup first: the push-notification tokens table, and
+	 * two uploaded files (profile photo, passport doc) that are personal
+	 * data in their own right. WooCommerce orders are deliberately left
+	 * alone — they keep their own billing snapshot independent of the user
+	 * record, which is the standard, legally-expected way to retain
+	 * financial/tax records after a customer deletes their account.
+	 */
+	public static function delete_user_account( $uid ) {
+		$uid = (int) $uid;
+		if ( $uid <= 0 ) {
+			return false;
 		}
 
 		global $wpdb;
@@ -1493,11 +1515,7 @@ final class Pangaea_Mobile_API {
 		if ( ! function_exists( 'wp_delete_user' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/user.php';
 		}
-		if ( ! wp_delete_user( $uid ) ) {
-			return self::fail( 'delete_failed', 'Could not delete account. Please try again.', 500 );
-		}
-
-		return self::ok( array( 'deleted' => true ) );
+		return (bool) wp_delete_user( $uid );
 	}
 
 	private static function mask_email( $email ) {

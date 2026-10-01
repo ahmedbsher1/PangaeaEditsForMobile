@@ -228,6 +228,7 @@ final class Pangaea_Mobile_API {
 		self::route( '/auth/refresh', 'POST', 'auth_refresh', false );
 		self::route( '/auth/password/forgot', 'POST', 'auth_password_forgot', false );
 		self::route( '/auth/password/change', 'POST', 'auth_password_change', true );
+		self::route( '/account', 'DELETE', 'delete_account', true );
 
 		self::route( '/user/profile', 'GET', 'get_profile', true );
 		self::route( '/user/profile', 'PATCH', 'update_profile', true );
@@ -1436,6 +1437,67 @@ final class Pangaea_Mobile_API {
 		wp_set_password( $new, $uid );
 		delete_user_meta( $uid, self::REFRESH_META );
 		return self::ok( array( 'changed' => true ) );
+	}
+
+	/**
+	 * Account deletion — required by both app stores for any app that lets
+	 * people create an account. Confirms the current password first (a
+	 * stolen access token alone shouldn't be enough to destroy the
+	 * account), except for Google/Apple-only accounts, which have no
+	 * usable WP password to confirm with — the valid access token itself
+	 * is the only credential those ever had.
+	 *
+	 * wp_delete_user() purges every usermeta row for this user on its own
+	 * (saved travellers, billing/health profile, wishlist, notification
+	 * feed, refresh tokens — all stored as usermeta), so nothing here
+	 * re-deletes those individually. Two things live outside usermeta and
+	 * need explicit cleanup first: the push-notification tokens table, and
+	 * two uploaded files (profile photo, passport doc) that are personal
+	 * data in their own right. WooCommerce orders are deliberately left
+	 * alone — they keep their own billing snapshot independent of the user
+	 * record, which is the standard, legally-expected way to retain
+	 * financial/tax records after a customer deletes their account.
+	 */
+	public static function delete_account( $request ) {
+		$uid  = self::user_id_from_request( $request );
+		$user = get_userdata( $uid );
+		if ( ! $user ) {
+			return self::fail( 'user_not_found', 'Account not found.', 404 );
+		}
+
+		$data         = self::request_data( $request );
+		$password     = (string) ( $data['password'] ?? '' );
+		$has_password = '' !== (string) $user->user_pass;
+		if ( $has_password && ! wp_check_password( $password, $user->user_pass, $uid ) ) {
+			return self::fail( 'invalid_password', 'Current password is incorrect.', 401 );
+		}
+
+		global $wpdb;
+		$wpdb->delete( $wpdb->prefix . 'pga_push_tokens', array( 'user_id' => $uid ) );
+
+		$wte_meta      = get_user_meta( $uid, 'wte_users_meta', true );
+		$avatar_att_id = is_array( $wte_meta ) ? (int) ( $wte_meta['user_profile_image_id'] ?? 0 ) : 0;
+		if ( $avatar_att_id > 0 ) {
+			wp_delete_attachment( $avatar_att_id, true );
+		}
+
+		$passport_url = (string) get_user_meta( $uid, '_pga_acct_passport_url', true );
+		if ( '' !== $passport_url ) {
+			$upload_dir    = wp_upload_dir();
+			$passport_path = str_replace( $upload_dir['baseurl'], $upload_dir['basedir'], $passport_url );
+			if ( 0 === strpos( $passport_path, $upload_dir['basedir'] ) && file_exists( $passport_path ) ) {
+				wp_delete_file( $passport_path );
+			}
+		}
+
+		if ( ! function_exists( 'wp_delete_user' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/user.php';
+		}
+		if ( ! wp_delete_user( $uid ) ) {
+			return self::fail( 'delete_failed', 'Could not delete account. Please try again.', 500 );
+		}
+
+		return self::ok( array( 'deleted' => true ) );
 	}
 
 	private static function mask_email( $email ) {

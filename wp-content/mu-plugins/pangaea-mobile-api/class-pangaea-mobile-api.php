@@ -2596,7 +2596,7 @@ final class Pangaea_Mobile_API {
 		return self::ok(
 			array(
 				'query'        => $query,
-				'did_you_mean' => self::did_you_mean_suggestion( $query ),
+				'did_you_mean' => self::did_you_mean_suggestion( $query, $lang ),
 				'items'        => array_values( array_filter( $items ) ),
 				'language'     => $lang,
 			)
@@ -2733,7 +2733,7 @@ final class Pangaea_Mobile_API {
 		return self::ok(
 			array(
 				'query'        => $query,
-				'did_you_mean' => self::did_you_mean_suggestion( $query ),
+				'did_you_mean' => self::did_you_mean_suggestion( $query, $lang ),
 				'items'        => array_values( $items ),
 				'language'     => $lang,
 			)
@@ -2741,27 +2741,149 @@ final class Pangaea_Mobile_API {
 	}
 
 	/**
-	 * Every word (3+ Latin letters) worth spell-correcting against: term
-	 * names from the four filterable taxonomies, plus every published trip
-	 * title. Cached — this scans the whole catalogue, but only ever changes
-	 * when a trip/term is added or renamed.
+	 * UTF-8 safe levenshtein distance (PHP's native levenshtein() counts
+	 * bytes, not characters, so it silently miscounts any multi-byte script
+	 * — Arabic included, at 2 bytes/char). Standard single-row DP over
+	 * mb_str_split() arrays.
 	 */
-	private static function did_you_mean_vocabulary() {
-		$cache_key = 'pangaea_did_you_mean_vocab_v1';
+	private static function mb_levenshtein( $a, $b ) {
+		$a_chars = mb_str_split( $a );
+		$b_chars = mb_str_split( $b );
+		$a_len   = count( $a_chars );
+		$b_len   = count( $b_chars );
+		if ( 0 === $a_len ) {
+			return $b_len;
+		}
+		if ( 0 === $b_len ) {
+			return $a_len;
+		}
+		$prev = range( 0, $b_len );
+		for ( $i = 1; $i <= $a_len; $i++ ) {
+			$curr = array( $i );
+			for ( $j = 1; $j <= $b_len; $j++ ) {
+				$cost       = ( $a_chars[ $i - 1 ] === $b_chars[ $j - 1 ] ) ? 0 : 1;
+				$curr[ $j ] = min( $prev[ $j ] + 1, $curr[ $j - 1 ] + 1, $prev[ $j - 1 ] + $cost );
+			}
+			$prev = $curr;
+		}
+		return $prev[ $b_len ];
+	}
+
+	/**
+	 * Generic connector words excluded from the vocabulary — otherwise a
+	 * word like "from" (appearing in plenty of trip titles, e.g. "Private
+	 * Transfer from Riyadh") ends up a correction target in its own right,
+	 * surfacing nonsense suggestions for short/garbled queries that happen
+	 * to sit close to it. Arabic entries are already in their normalized
+	 * form (hamza variants -> ا, ى/ئ -> ي) since that's the only form
+	 * they're ever compared against.
+	 */
+	private static function did_you_mean_is_stopword( $key ) {
+		static $stopwords = array(
+			'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'have', 'in', 'is', 'it',
+			'its', 'of', 'on', 'or', 'that', 'the', 'to', 'was', 'were', 'will', 'with', 'your', 'you', 'we',
+			'our', 'this', 'these', 'those', 'all', 'any', 'can', 'do', 'does', 'if', 'into', 'more', 'most',
+			'no', 'not', 'so', 'than', 'then', 'there', 'their', 'they', 'but', 'about', 'over', 'under', 'up',
+			'down', 'out', 'off', 'per', 'each', 'few', 'how', 'what', 'when', 'where', 'which', 'who', 'whom',
+			'why', 'near', 'me', 'my',
+			'من', 'في', 'الي', 'علي', 'عن', 'ان', 'التي', 'الذي', 'هذا', 'هذه', 'ثم', 'او', 'لا', 'مع', 'بين',
+			'تحت', 'فوق', 'كل', 'هو', 'هي', 'كان', 'كانت', 'قد', 'لم', 'لن', 'ما', 'كيف', 'متي', 'اين', 'ماذا',
+			'نحن', 'انت', 'انتم', 'هم', 'هن',
+		);
+		return in_array( $key, $stopwords, true );
+	}
+
+	/**
+	 * A word's comparison key (heavily normalized — lowercased, accents and
+	 * Arabic diacritics stripped, hamza/alef-maksura/ta-marbuta variants
+	 * unified) versus the lightly-cleaned form actually shown back to the
+	 * customer (punctuation/diacritics stripped, but NOT letter-unified —
+	 * so an Arabic suggestion keeps its real spelling, e.g. a trailing ة
+	 * never turns into ه just because that's how it's matched internally).
+	 */
+	private static function did_you_mean_match_key( $word ) {
+		if ( function_exists( 'pangaea_smart_trip_search_normalize' ) ) {
+			return trim( pangaea_smart_trip_search_normalize( $word ) );
+		}
+		return function_exists( 'mb_strtolower' ) ? trim( mb_strtolower( $word, 'UTF-8' ) ) : trim( strtolower( $word ) );
+	}
+
+	private static function did_you_mean_display_form( $word ) {
+		$word = remove_accents( $word );
+		$word = preg_replace( '/[\x{064B}-\x{0652}\x{0640}]/u', '', $word ); // Arabic diacritics + tatweel only, letters untouched
+		$word = trim( (string) $word, ".,!?'\"" );
+		if ( preg_match( '/[a-zA-Z]/', $word ) ) {
+			$word = function_exists( 'mb_strtolower' ) ? mb_strtolower( $word, 'UTF-8' ) : strtolower( $word );
+		}
+		return $word;
+	}
+
+	/**
+	 * Tokenizes $text and adds each eligible word to $vocab as
+	 * [match_key => display_form], first occurrence wins. Skips stopwords,
+	 * anything shorter than the per-script minimum (2 for Arabic, 3 for
+	 * Latin — Arabic place/activity names run shorter once normalized), and
+	 * any token that isn't purely one script (catches stray digits/mixed
+	 * tokens, which are never useful spelling-correction targets).
+	 */
+	private static function did_you_mean_add_text( array &$vocab, $text ) {
+		$text = wp_strip_all_tags( html_entity_decode( (string) $text, ENT_QUOTES, get_bloginfo( 'charset' ) ) );
+		foreach ( preg_split( '/[\s,\/\-]+/u', $text ) as $raw_word ) {
+			$raw_word = trim( $raw_word, ".,!?'\"" );
+			if ( '' === $raw_word ) {
+				continue;
+			}
+			$key = self::did_you_mean_match_key( $raw_word );
+			// normalize() can turn one punctuation-glued "word" into several
+			// tokens (e.g. it inserts a space between a digit run and a
+			// letter run) — skip rather than mis-key a multi-word string as
+			// if it were one candidate.
+			if ( '' === $key || false !== strpos( $key, ' ' ) || self::did_you_mean_is_stopword( $key ) ) {
+				continue;
+			}
+			$is_arabic = (bool) preg_match( '/^\p{Arabic}+$/u', $key );
+			$is_latin  = (bool) preg_match( '/^[a-z]+$/', $key );
+			if ( ! $is_arabic && ! $is_latin ) {
+				continue;
+			}
+			if ( mb_strlen( $key, 'UTF-8' ) < ( $is_arabic ? 2 : 3 ) ) {
+				continue;
+			}
+			if ( ! isset( $vocab[ $key ] ) ) {
+				$vocab[ $key ] = self::did_you_mean_display_form( $raw_word );
+			}
+		}
+	}
+
+	/**
+	 * Real, searchable vocabulary for $lang ('en'/'ar') — taxonomy term
+	 * names and titles from every content type the app's search actually
+	 * covers (Journeys, Experiences, Stays), not a generic English word
+	 * list. Arabic uses WPML's real translated trip titles/terms and
+	 * Experiences' own name_ar-backed term_label()/titles, switching the
+	 * active WPML language only for the duration of this build and
+	 * restoring it afterwards. Stays contributes English only: its backend
+	 * (stay.pangaeaclub.net) has no Arabic content at all — confirmed
+	 * directly against its API, which returns identical English names
+	 * regardless of `lang`. Cached per language — this scans the whole
+	 * catalogue, but only changes when a trip/term/experience/room is
+	 * added or renamed.
+	 */
+	private static function did_you_mean_vocabulary( $lang ) {
+		$lang      = ( 'ar' === $lang ) ? 'ar' : 'en';
+		$cache_key = 'pangaea_did_you_mean_vocab_' . $lang . '_v2';
 		$cached    = get_transient( $cache_key );
 		if ( is_array( $cached ) ) {
 			return $cached;
 		}
 
-		$words = array();
-		$add   = function ( $text ) use ( &$words ) {
-			foreach ( preg_split( '/[\s,\/\-]+/', (string) $text ) as $word ) {
-				$word = strtolower( trim( $word, ".,!?'\"" ) );
-				if ( strlen( $word ) >= 3 && ! preg_match( '/[^a-z]/', $word ) ) {
-					$words[ $word ] = true;
-				}
-			}
-		};
+		$restore_lang = has_filter( 'wpml_current_language' ) ? apply_filters( 'wpml_current_language', null ) : null;
+		if ( has_action( 'wpml_switch_language' ) ) {
+			do_action( 'wpml_switch_language', $lang );
+		}
+
+		$vocab = array();
+		$is_ar = ( 'ar' === $lang );
 
 		foreach ( array( 'destination', 'activities', 'travelstyle', 'difficulty' ) as $tax ) {
 			if ( ! taxonomy_exists( $tax ) ) {
@@ -2770,7 +2892,7 @@ final class Pangaea_Mobile_API {
 			$terms = get_terms( array( 'taxonomy' => $tax, 'hide_empty' => false ) );
 			if ( ! is_wp_error( $terms ) ) {
 				foreach ( $terms as $term ) {
-					$add( $term->name );
+					self::did_you_mean_add_text( $vocab, $term->name );
 				}
 			}
 		}
@@ -2779,10 +2901,45 @@ final class Pangaea_Mobile_API {
 			array( 'post_type' => 'trip', 'post_status' => 'publish', 'posts_per_page' => -1, 'fields' => 'ids' )
 		);
 		foreach ( $trip_ids as $trip_id ) {
-			$add( get_the_title( $trip_id ) );
+			$title = get_the_title( $trip_id );
+			if ( self::text_matches_lang( $title, $lang ) ) {
+				self::did_you_mean_add_text( $vocab, $title );
+			}
 		}
 
-		$vocab = array_keys( $words );
+		if ( self::experiences_available() ) {
+			foreach ( array( Pangaea_Experiences::TAX, Pangaea_Experiences::TAX_DEST ) as $tax ) {
+				$terms = get_terms( array( 'taxonomy' => $tax, 'hide_empty' => false ) );
+				if ( ! is_wp_error( $terms ) ) {
+					foreach ( $terms as $term ) {
+						self::did_you_mean_add_text( $vocab, Pangaea_Experiences::term_label( $term, $is_ar ) );
+					}
+				}
+			}
+			$experience_ids = get_posts(
+				array( 'post_type' => Pangaea_Experiences::CPT, 'post_status' => 'publish', 'posts_per_page' => -1, 'fields' => 'ids' )
+			);
+			foreach ( $experience_ids as $experience_id ) {
+				$title = get_the_title( $experience_id );
+				if ( self::text_matches_lang( $title, $lang ) ) {
+					self::did_you_mean_add_text( $vocab, $title );
+				}
+			}
+		}
+
+		if ( ! $is_ar ) {
+			$stays = self::stays_all_rooms();
+			foreach ( (array) ( $stays['rooms'] ?? array() ) as $room ) {
+				self::did_you_mean_add_text( $vocab, (string) ( $room['title'] ?? '' ) );
+				self::did_you_mean_add_text( $vocab, (string) ( $room['subtitle'] ?? '' ) );
+				self::did_you_mean_add_text( $vocab, (string) ( $room['location']['name'] ?? '' ) );
+			}
+		}
+
+		if ( $restore_lang && has_action( 'wpml_switch_language' ) ) {
+			do_action( 'wpml_switch_language', $restore_lang );
+		}
+
 		set_transient( $cache_key, $vocab, 6 * HOUR_IN_SECONDS );
 		return $vocab;
 	}
@@ -2791,44 +2948,49 @@ final class Pangaea_Mobile_API {
 	 * "Did you mean" spelling correction for the app's search box —
 	 * separate from the existing fuzzy-scoring search engine (which already
 	 * tolerates typos when ranking results, but never tells the customer
-	 * what it matched). Word-by-word nearest-vocabulary-match via
-	 * levenshtein(), English/Latin-script only for now (Arabic needs a
-	 * different normalization approach — diacritics/letter-shape variants
-	 * — rather than plain character-distance matching, so it's intentionally
-	 * left alone here rather than giving bad corrections). Returns null when
-	 * the query already matches known vocabulary, or no confident
-	 * correction exists.
+	 * what it matched). Word-by-word nearest-vocabulary-match via a UTF-8
+	 * safe levenshtein(), now covering both English and Arabic: $lang picks
+	 * which real (Journeys/Experiences/Stays) vocabulary to match against,
+	 * and falls back to script-detecting the query itself when the caller
+	 * didn't resolve a language. Returns null when the query already
+	 * matches known vocabulary, or no confident correction exists.
 	 */
-	private static function did_you_mean_suggestion( $query ) {
+	private static function did_you_mean_suggestion( $query, $lang = '' ) {
 		$query = trim( (string) $query );
-		if ( strlen( $query ) < 3 || preg_match( '/[^\x00-\x7F]/', $query ) ) {
+		if ( '' === $query ) {
 			return null;
 		}
 
-		$vocab   = self::did_you_mean_vocabulary();
-		$words   = preg_split( '/\s+/', strtolower( $query ) );
+		$lang  = in_array( $lang, array( 'en', 'ar' ), true ) ? $lang : ( preg_match( '/\p{Arabic}/u', $query ) ? 'ar' : 'en' );
+		$vocab = self::did_you_mean_vocabulary( $lang );
+		if ( empty( $vocab ) ) {
+			return null;
+		}
+
+		$min_len = ( 'ar' === $lang ) ? 2 : 3;
+		$words   = preg_split( '/\s+/u', $query );
 		$changed = false;
 		$out     = array();
 
 		foreach ( $words as $word ) {
-			$clean = trim( $word, ".,!?'\"" );
-			if ( strlen( $clean ) < 3 || in_array( $clean, $vocab, true ) ) {
+			$key = self::did_you_mean_match_key( trim( $word, ".,!?'\"" ) );
+			if ( '' === $key || mb_strlen( $key, 'UTF-8' ) < $min_len || isset( $vocab[ $key ] ) ) {
 				$out[] = $word;
 				continue;
 			}
 			$best      = null;
 			$best_dist = null;
-			foreach ( $vocab as $candidate ) {
-				if ( abs( strlen( $candidate ) - strlen( $clean ) ) > 3 ) {
+			foreach ( $vocab as $candidate_key => $candidate_display ) {
+				if ( abs( mb_strlen( $candidate_key, 'UTF-8' ) - mb_strlen( $key, 'UTF-8' ) ) > 3 ) {
 					continue;
 				}
-				$dist = levenshtein( $clean, $candidate );
+				$dist = self::mb_levenshtein( $key, $candidate_key );
 				if ( null === $best_dist || $dist < $best_dist ) {
 					$best_dist = $dist;
-					$best      = $candidate;
+					$best      = $candidate_display;
 				}
 			}
-			$threshold = max( 1, (int) round( strlen( $clean ) * 0.4 ) );
+			$threshold = max( 1, (int) round( mb_strlen( $key, 'UTF-8' ) * 0.4 ) );
 			if ( $best && $best_dist > 0 && $best_dist <= $threshold ) {
 				$out[]   = $best;
 				$changed = true;

@@ -1074,15 +1074,33 @@ final class Pangaea_Mobile_API {
 		if ( is_wp_error( $user_id ) ) {
 			return $user_id;
 		}
+		$name_parts = self::split_full_name( (string) ( $row['name'] ?? '' ) );
 		wp_update_user(
 			array(
 				'ID'           => $user_id,
 				'display_name' => $row['name'] ?: $email,
-				'first_name'   => $row['name'] ?: '',
+				'first_name'   => $name_parts['first'],
+				'last_name'    => $name_parts['last'],
 			)
 		);
 		delete_transient( $key );
 		return self::ok( self::auth_payload( $user_id ), 201 );
+	}
+
+	/**
+	 * Registration only collects one free-text "name" field, not separate
+	 * first/last inputs, so split it here rather than dumping the whole
+	 * string into first_name and leaving last_name empty — that previously
+	 * left every new account with no last name on record.
+	 */
+	private static function split_full_name( $full_name ) {
+		$full_name = trim( $full_name );
+		if ( '' === $full_name ) {
+			return array( 'first' => '', 'last' => '' );
+		}
+		$parts = preg_split( '/\s+/', $full_name );
+		$first = array_shift( $parts );
+		return array( 'first' => $first, 'last' => implode( ' ', $parts ) );
 	}
 
 	public static function auth_login( $request ) {

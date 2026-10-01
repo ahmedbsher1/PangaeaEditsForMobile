@@ -246,6 +246,9 @@ final class Pangaea_Mobile_API {
 		self::route( '/travellers/(?P<traveller_id>[A-Za-z0-9_-]+)', 'DELETE', 'delete_traveller', true );
 		self::route( '/travellers/(?P<traveller_id>[A-Za-z0-9_-]+)/passport', 'POST', 'upload_traveller_passport', true );
 
+		self::route( '/device-token', 'POST', 'register_device_token', true );
+		self::route( '/device-token', 'DELETE', 'unregister_device_token', true );
+
 		self::route( '/user/wishlist', 'GET', 'get_wishlist', true );
 		self::route( '/user/wishlist/(?P<trip_id>\d+)', 'POST', 'add_to_wishlist', true );
 		self::route( '/user/wishlist/(?P<trip_id>\d+)', 'DELETE', 'remove_from_wishlist', true );
@@ -1808,6 +1811,62 @@ final class Pangaea_Mobile_API {
 		$ids = get_user_meta( $uid, self::WISHLIST_META, true );
 		$ids = is_array( $ids ) ? $ids : array();
 		return array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
+	}
+
+	/**
+	 * Registers (or re-registers) this device's FCM token against the
+	 * logged-in user, for Pangaea Push Notifications
+	 * (mu-plugins/pangaea-push-notifications.php) to send to. `token` is
+	 * UNIQUE across the table — re-sending the same token just moves it to
+	 * the current user (covers the shared-device / different-account-login
+	 * case) and bumps updated_at, rather than erroring on duplicate.
+	 */
+	public static function register_device_token( $request ) {
+		$uid = self::user_id_from_request( $request );
+		$data = self::request_data( $request );
+		$token = sanitize_text_field( (string) ( $data['token'] ?? '' ) );
+		$platform = sanitize_key( (string) ( $data['platform'] ?? '' ) );
+
+		if ( '' === $token ) {
+			return self::fail( 'token_required', 'A device token is required.' );
+		}
+
+		global $wpdb;
+		$table = $wpdb->prefix . 'pga_push_tokens';
+		$now   = current_time( 'mysql' );
+
+		$existing_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE token = %s", $token ) );
+		if ( $existing_id ) {
+			$wpdb->update(
+				$table,
+				array( 'user_id' => $uid, 'platform' => $platform, 'updated_at' => $now ),
+				array( 'id' => (int) $existing_id )
+			);
+		} else {
+			$wpdb->insert(
+				$table,
+				array(
+					'user_id'    => $uid,
+					'token'      => $token,
+					'platform'   => $platform,
+					'created_at' => $now,
+					'updated_at' => $now,
+				)
+			);
+		}
+
+		return self::ok( array( 'registered' => true ) );
+	}
+
+	public static function unregister_device_token( $request ) {
+		$data  = self::request_data( $request );
+		$token = sanitize_text_field( (string) ( $data['token'] ?? '' ) );
+		if ( '' === $token ) {
+			return self::fail( 'token_required', 'A device token is required.' );
+		}
+		global $wpdb;
+		$wpdb->delete( $wpdb->prefix . 'pga_push_tokens', array( 'token' => $token ) );
+		return self::ok( array( 'unregistered' => true ) );
 	}
 
 	public static function get_wishlist( $request ) {

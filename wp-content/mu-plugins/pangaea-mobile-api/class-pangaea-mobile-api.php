@@ -35,6 +35,7 @@ final class Pangaea_Mobile_API {
 		// ever fires for a genuine booking confirmation, not a guessed one.
 		add_action( 'woocommerce_order_status_processing', array( __CLASS__, 'notify_booking_confirmed' ), 20, 2 );
 		add_filter( 'rest_pre_serve_request', array( __CLASS__, 'prevent_edge_caching' ), 10, 4 );
+		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'enforce_trip_password' ), 10, 3 );
 	}
 
 	/**
@@ -271,6 +272,7 @@ final class Pangaea_Mobile_API {
 		self::route( '/trips/filters', 'GET', 'trip_filters', false );
 		self::route( '/trips/calendar', 'GET', 'trip_calendar', false );
 		self::route( '/trips/(?P<trip_id>\d+)', 'GET', 'get_trip', false );
+		self::route( '/trips/(?P<trip_id>[0-9]+)/unlock', 'POST', 'unlock_trip', false );
 		self::route( '/trips/(?P<trip_id>\d+)/itinerary', 'GET', 'get_trip_itinerary', false );
 		self::route( '/trips/(?P<trip_id>\d+)/gallery', 'GET', 'get_trip_gallery', false );
 		self::route( '/trips/(?P<trip_id>\d+)/faqs', 'GET', 'get_trip_faqs', false );
@@ -865,6 +867,7 @@ final class Pangaea_Mobile_API {
 	}
 
 	private static function add_mobile_card_fields( $payload, $trip_id ) {
+		$payload['is_password_protected'] = class_exists( 'Pangaea_Trip_Password' ) ? Pangaea_Trip_Password::is_protected( (int) $trip_id ) : false;
 		$badge_label = trim( (string) get_post_meta( $trip_id, self::BADGE_LABEL_META, true ) );
 		$badge_date  = self::sanitize_badge_date( get_post_meta( $trip_id, self::BADGE_DATE_META, true ) );
 		$payload['badge_label'] = '' !== $badge_label ? $badge_label : null;
@@ -3227,6 +3230,112 @@ final class Pangaea_Mobile_API {
 			}
 		}
 		return self::ok( array( 'items' => $items ) );
+	}
+
+	/**
+	 * Password-protected trips (Pangaea_Trip_Password,
+	 * mu-plugins/pangaea-trip-password.php) — set from the "Password
+	 * Protection" box on the trip edit page and shared by the Arabic and
+	 * English versions. The app sends the password in the
+	 * `X-Pangaea-Trip-Password` header (or a `trip_password` param) on every
+	 * trip-scoped call; enforce_trip_password() below rejects the trip's
+	 * detail/sub-resources and every booking entry point without it.
+	 */
+	private static function trip_password_from_request( $request ) {
+		$given = (string) $request->get_header( 'x-pangaea-trip-password' );
+		if ( '' === $given ) {
+			$given = (string) $request->get_param( 'trip_password' );
+		}
+		return $given;
+	}
+
+	private static function trip_password_failure_key( $trip_id ) {
+		$ip = isset( $_SERVER['HTTP_CF_CONNECTING_IP'] ) ? $_SERVER['HTTP_CF_CONNECTING_IP'] : ( isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '' );
+		return 'pangaea_mobile_trippw_fail_' . md5( sanitize_text_field( wp_unslash( (string) $ip ) ) . '|' . (int) $trip_id );
+	}
+
+	private static function locked_trip_summary( $trip_id ) {
+		return array(
+			'trip_id'               => (int) $trip_id,
+			'title'                 => wp_strip_all_tags( get_the_title( $trip_id ) ),
+			'image'                 => (string) get_the_post_thumbnail_url( $trip_id, 'large' ),
+			'is_password_protected' => true,
+		);
+	}
+
+	/** Null when this request may see the trip, otherwise the WP_Error to return. */
+	private static function trip_password_error( $request, $trip_id ) {
+		$trip_id = (int) $trip_id;
+		if ( $trip_id <= 0 || ! class_exists( 'Pangaea_Trip_Password' ) || ! Pangaea_Trip_Password::is_protected( $trip_id ) ) {
+			return null;
+		}
+		$given = self::trip_password_from_request( $request );
+		$key   = self::trip_password_failure_key( $trip_id );
+		if ( '' === $given ) {
+			return self::fail( 'trip_password_required', 'This trip is password protected.', 403, self::locked_trip_summary( $trip_id ) );
+		}
+		if ( (int) get_transient( $key ) >= 10 ) {
+			return self::fail( 'too_many_attempts', 'Too many incorrect passwords. Please try again in 15 minutes.', 429 );
+		}
+		if ( ! Pangaea_Trip_Password::check( $trip_id, $given ) ) {
+			set_transient( $key, (int) get_transient( $key ) + 1, 15 * MINUTE_IN_SECONDS );
+			return self::fail( 'invalid_trip_password', 'Incorrect trip password.', 403, self::locked_trip_summary( $trip_id ) );
+		}
+		delete_transient( $key );
+		return null;
+	}
+
+	public static function enforce_trip_password( $response, $handler, $request ) {
+		if ( ! $request instanceof WP_REST_Request ) {
+			return $response;
+		}
+		$route  = (string) $request->get_route();
+		$prefix = '/' . self::NS . '/';
+		if ( 0 !== strpos( $route, $prefix ) ) {
+			return $response;
+		}
+		$path     = substr( $route, strlen( $prefix ) - 1 );
+		$trip_ids = array();
+		if ( preg_match( '#^/trips/([0-9]+)(?:/([a-z-]+))?$#', $path, $m ) ) {
+			$sub = isset( $m[2] ) ? $m[2] : '';
+			if ( ! in_array( $sub, array( 'enquiry', 'local-enquiry', 'enquiry-fields', 'unlock' ), true ) ) {
+				$trip_ids[] = (int) $m[1];
+			}
+		} elseif ( in_array( $path, array( '/quote', '/cart/items', '/checkout/orders', '/checkout/validate' ), true ) ) {
+			$data       = self::request_data( $request );
+			$trip_ids[] = (int) ( isset( $data['trip_id'] ) ? $data['trip_id'] : 0 );
+			if ( isset( $data['quote'] ) && is_array( $data['quote'] ) ) {
+				$trip_ids[] = (int) ( isset( $data['quote']['trip_id'] ) ? $data['quote']['trip_id'] : 0 );
+			}
+		}
+		foreach ( array_unique( array_filter( $trip_ids ) ) as $trip_id ) {
+			$error = self::trip_password_error( $request, $trip_id );
+			if ( $error ) {
+				return $error;
+			}
+		}
+		return $response;
+	}
+
+	/** POST /trips/{id}/unlock {"password": "..."} — lets the app validate a password before storing it. */
+	public static function unlock_trip( $request ) {
+		$trip_id = (int) $request['trip_id'];
+		$post    = get_post( $trip_id );
+		if ( ! $post || 'trip' !== $post->post_type ) {
+			return self::fail( 'not_found', 'Trip not found.', 404 );
+		}
+		if ( ! class_exists( 'Pangaea_Trip_Password' ) || ! Pangaea_Trip_Password::is_protected( $trip_id ) ) {
+			return self::ok( array( 'trip_id' => $trip_id, 'is_password_protected' => false, 'unlocked' => true ) );
+		}
+		$data = self::request_data( $request );
+		if ( '' === self::trip_password_from_request( $request ) && isset( $data['password'] ) ) {
+			$request->set_param( 'trip_password', (string) $data['password'] );
+		}
+		$error = self::trip_password_error( $request, $trip_id );
+		if ( $error ) {
+			return $error;
+		}
+		return self::ok( array( 'trip_id' => $trip_id, 'is_password_protected' => true, 'unlocked' => true ) );
 	}
 
 	public static function get_trip( $request ) {
